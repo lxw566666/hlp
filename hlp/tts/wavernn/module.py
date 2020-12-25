@@ -6,7 +6,7 @@ import scipy.io.wavfile as wave
 import hlp.tts.utils.load_dataset as _dataset
 from hlp.tts.utils.spec import melspectrogram2wav, spec_distance
 from hlp.tts.utils.text_preprocess import text_to_phonemes, text_to_sequence_phoneme
-
+import numpy as np
 
 def train(epochs: int, train_data_path: str, max_len: int, vocab_size: int,
           batch_size: int, buffer_size: int, checkpoint_save_freq: int,
@@ -41,10 +41,6 @@ def train(epochs: int, train_data_path: str, max_len: int, vocab_size: int,
                            valid_data_path=valid_data_path, max_train_data_size=max_train_data_size,
                            max_valid_data_size=max_valid_data_size)
 
-    if steps_per_epoch == 0:
-        print("训练数据量过小，小于batch_size，请添加数据后重试")
-        exit(0)
-
     for epoch in range(epochs):
         print('Epoch {}/{}'.format(epoch + 1, epochs))
         start_time = time.time()
@@ -64,11 +60,6 @@ def train(epochs: int, train_data_path: str, max_len: int, vocab_size: int,
 
         if (epoch + 1) % checkpoint_save_freq == 0:
             checkpoint.save()
-
-            if valid_steps_per_epoch == 0:
-                print("验证数据量过小，小于batch_size，请添加数据后重试")
-                exit(0)
-
             _valid_step(model=model, dataset=valid_dataset, steps_per_epoch=valid_steps_per_epoch)
 
     return mel_outputs
@@ -238,12 +229,12 @@ def _valid_step(model: tf.keras.Model, dataset: tf.data.Dataset, steps_per_epoch
                                                   total_loss / steps_per_epoch))
 
 
-def load_checkpoint(model: tf.keras.Model, checkpoint_dir: str, execute_type: str, checkpoint_save_size: int):
+def load_checkpoint(model: tf.keras.Model, checkpoint_dir: str, checkpoint_save_size: int):
     """
     恢复检查点
     """
     # 如果检查点存在就恢复，如果不存在就重新创建一个
-    checkpoint = tf.train.Checkpoint(tacotron2=model)
+    checkpoint = tf.train.Checkpoint(wavernn=model)
     ckpt_manager = tf.train.CheckpointManager(checkpoint, checkpoint_dir, max_to_keep=checkpoint_save_size)
 
     if os.path.exists(checkpoint_dir):
@@ -251,8 +242,63 @@ def load_checkpoint(model: tf.keras.Model, checkpoint_dir: str, execute_type: st
             checkpoint.restore(ckpt_manager.latest_checkpoint).expect_partial()
     else:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        if execute_type == "generate":
-            print("没有检查点，请先执行train模式")
-            exit(0)
+        # if execute_type == "generate":
+        #     print("没有检查点，请先执行train模式")
+        #     exit(0)
 
     return ckpt_manager
+
+
+def Discretized_Mix_Logistic_Loss(
+        labels,
+        logits,
+        classes=65536,
+        log_scale_min=None
+):
+    '''
+    labels: [Batch, Time]
+    logits: [Batch, Time, Dim]
+    '''
+    classes = tf.cast(classes, dtype=logits.dtype)
+
+    if log_scale_min is None:
+        log_scale_min = float(np.log(1e-14))
+    if logits.get_shape()[-1] % 3 != 0:
+        raise ValueError('The dimension of \'y\' must be a multiple of 3.')
+    nr_mix = logits.get_shape()[-1] // 3
+
+    logit_probs, means, log_scales = tf.split(logits, num_or_size_splits=3, axis=-1)  # [Batch, Time, Dim // 3]
+    log_scales = tf.maximum(log_scales, log_scale_min)  # [Batch, Time]
+
+    labels = tf.cast(tf.tile(
+        tf.expand_dims(labels, axis=-1),
+        [1, 1, means.get_shape()[-1]]
+    ), dtype=logits.dtype)
+    cetnered_labels = labels - means
+    inv_stdv = tf.exp(-log_scales)
+
+    plus_in = inv_stdv * (cetnered_labels + 1 / (classes - 1))
+    cdf_plus = tf.math.sigmoid(plus_in)
+    min_in = inv_stdv * (cetnered_labels - 1 / (classes - 1))
+    cdf_min = tf.math.sigmoid(min_in)
+
+    log_cdf_plus = plus_in - tf.math.softplus(plus_in)
+    log_one_minus_cdf_min = -tf.math.softplus(min_in)
+    cdf_delta = cdf_plus - cdf_min
+
+    mid_in = inv_stdv * cetnered_labels
+    log_pdf_mid = mid_in - log_scales - 2.0 * tf.math.softplus(mid_in)
+
+    inner_inner_cond = tf.cast(tf.greater(cdf_delta, 1e-5), dtype=logits.dtype)
+    inner_inner_out = \
+        inner_inner_cond * tf.math.log(tf.maximum(cdf_delta, 1e-12)) + \
+        (1.0 - inner_inner_cond) * (log_pdf_mid - tf.math.log((classes - 1) / 2))
+    inner_cond = tf.cast(tf.greater(labels, 0.999), dtype=logits.dtype)
+    inner_out = \
+        inner_cond * log_one_minus_cdf_min + \
+        (1.0 - inner_cond) * inner_inner_out
+    cond = tf.cast(tf.less(labels, -0.999), dtype=logits.dtype)
+    log_probs = cond * log_cdf_plus + (1.0 - cond) * inner_out
+    log_probs = log_probs + tf.math.log_softmax(logit_probs, -1)
+
+    return -tf.reduce_mean(tf.math.reduce_logsumexp(log_probs, axis=-1, keepdims=True))
